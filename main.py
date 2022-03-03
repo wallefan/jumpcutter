@@ -138,11 +138,11 @@ def audio_only(file, outfile, threshold=0.3, padding_time=0.05):
     print('done.')
 
 
-def jumpcut(file, outfile, threshold=0.7, padding_time=0.02, sound_speed=1, silent_speed=0):
-    print('Scanning audio...', end='')
+def jumpcut(file, outfile, threshold=0.7, padding_time=0.02, sound_speed=1, silent_speed=0, subtitles=None):
+    print('Scanning audio...', end='', flush=True)
     meaningful_parts = find_meaningful_audio(file, threshold)
     print('done (keep %f%%).' % (sum(meaningful_parts) * 100 / len(meaningful_parts)))
-    print('Locating speech...', end='')
+    print('Locating speech...', end='', flush=True)
     add_padding(meaningful_parts, int(padding_time / FRAME_LENGTH))
     print('done (keep %f%%).' % (sum(meaningful_parts) * 100 / len(meaningful_parts)))
     print('Building timeline...')
@@ -156,65 +156,118 @@ def jumpcut(file, outfile, threshold=0.7, padding_time=0.02, sound_speed=1, sile
     # TODO implement audio time stretching
     assert sound_speed == 1 and silent_speed == 0
 
-    #with tempfile.TemporaryDirectory() as d:
-    d = '/tmp/jumpcutter'
-    os.mkdir(d)
-    if True:
-        print('Processing subtitles...', end='')
-        subprocess.check_call(['ffmpeg', '-i', file, os.path.join(d, 'subtitles.ass')], stderr=subprocess.DEVNULL)
-        with open(os.path.join(d, 'subtitles.ass')) as fin, open(os.path.join(d, 'converted.ass'), 'w') as fout:
-            process_subtitles(fin, fout, converter)
-        print('done.')
+    with tempfile.TemporaryDirectory() as tmpdir:
+        print('Processing subtitles...', end='', flush=True)
+        if subtitles is None:
+            rc = subprocess.run(['ffmpeg', '-i', file, os.path.join(tmpdir, 'subtitles.ass')], stderr=subprocess.DEVNULL).returncode
+            if rc == 0:  # ffmpeg will return 1 if there is no subtitle stream.
+                subtitles = os.path.join(tmpdir, 'subtitles.ass')
+        elif not subtitles.endswith('.ass'):
+            subprocess.check_call(['ffmpeg', '-i', subtitles, os.path.join(tmpdir, 'subtitles.ass')], stderr=subprocess.DEVNULL)
+            subtitles = os.path.join(tmpdir, 'subtitles.ass') 
+        if subtitles:
+            with open(subtitles) as fin, open(os.path.join(tmpdir, 'converted.ass'), 'w') as fout:
+                process_subtitles(fin, fout, converter)
+            print('done.')
+        else:
+            print('nothing to do.')
 
-        print('Processing audio...', end='')
+        print('Processing audio...', end='', flush=True)
         # TODO process the audio more intelligently
-        _jumpcut_audio(file, os.path.join(d, 'audio.wav'), meaningful_parts)
+        _jumpcut_audio(file, os.path.join(tmpdir, 'audio.wav'), meaningful_parts)
         print('done.')
 
-        # print('Extracting frames...')
-        # extract_all_frames(file, d, framerate)
-        # print('done.')
-        # 
-        # print('Processing frames...')
-        # process_frames(d, converter, framerate)
-        # print('done.')
-
-        ptsfilter = 'setpts='+converter.generate_setpts_expr()
-        print('pts filter bytes:', len(ptsfilter))
+        print('Processing video...')
+        video_filtergraph = process_video(file, tmpdir, converter)
+        print('done.')
 
         print('Encoding final result...')
         # TODO make subtitles optional
-        subprocess.check_call(['/home/seanw/PycharmProjects/jumpcutter/private_ffmpeg', '-hide_banner',
-                                 '-i', file,
-                                 '-i', os.path.join(d, 'audio.wav'),  # wave file of audio (which we are piping into ffmpeg)
-                                 '-i', os.path.join(d, 'converted.ass'),  # subtitle file
-                                 '-r', str(framerate),  # set framerate of the video data
-                                 '-map', '0:v', '-map', '1:a', '-map', 2,
-                                 '-vf', ptsfilter,
-                                 outfile],
-                                stdin=subprocess.PIPE)
+        subprocess.check_call(['/home/seanw/PycharmProjects/jumpcutter/private_ffmpeg', '-y', '-hide_banner',
+                                 '-filter_complex', video_filtergraph,
+                                 '-i', 'audio.wav']  # wave file of audio (which we are piping into ffmpeg)
+                                 + (['-i', 'converted.ass'] if subtitles else [])  # subtitle file
+                                 +[os.path.abspath(outfile)],
+                                stdin=subprocess.PIPE, cwd=tmpdir)
         print('done.')
 
 
+class _FakeTemporaryDirectory:
+    """Drop in replacement for """
+    def __init__(self, dir):
+        self.dir = dir
+    def __enter__(self):
+        # if os.path.exists(self.dir):
+        #     import shutil
+        #     shutil.rmtree(self.dir)
+        # os.mkdir(self.dir)
+        return self.dir
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
 def process_video(input_file, tempdir, timestretch:NonLinearTime):
+    """
+    Apply nonlinear speedup to the video portion.  We do this by altering the presentation timestamp (PTS) of each frame
+    using ffmpeg's setpts filter, which takes an expression that ffmpeg will evaluate internally for every frame of the
+    video, passing a different PTS parameter each time.  The best way to explain this expression is with an example.
+
+    Suppose we have a video file with 10 seconds long, with sound from 3 seconds to 6 seconds.  We've been
+    asked to speed up the sounded portions by a factor of 2 and the silent portions by a factor of 4.
+
+    PTS is an integer, in units of TB seconds (TB, which stands for "time base", is another argument passed to the
+    expression, and for most videos it has a value of 1/90,000).  In Python this expression would be:
+
+    if PTS < 3/TB:
+        return PTS * 0.25 # speedup by factor of 4 from 0 seconds to 3 seconds (this will result in 0.75 seconds of video)
+    elif PTS < 6/TB:
+        return (PTS - 3/TB) * 0.5 + 0.75/TB  # speedup by factor of 2 from 3 seconds to 6 seconds
+                                             # (we subtract the amount of time since the start of the current window,
+                                             #  multiply by the speedup factor, and add back the time we subtracted)
+    else:
+        return (PTS - 6/TB) * 0.25 + 3.75/TB
+
+    etc.
+
+    Translated to ffmpeg's expression format it becomes:
+
+    if(lt(PTS,3/TB),PTS*0.25,if(lt(PTS,6/TB),(PTS-3/TB)*0.5+0.75/TB), ... )
+
+    Due to the number of state transitions in the average video, these expressions quickly become so long and so complex
+    that even after modifying and recompiling ffmpeg to increase the expression parser's arbitrary limit of 100 nested
+    sets of parentheses to 10,000 (hence the use of ./private_ffmpeg, which is our modified version), we are still
+    forced to break the expression into chunks because Linux won't let you pass a program an argument longer than 32,767
+    characters.
+
+    To work around this, we break the video into chunks, then return some information to our caller as to how to tell
+    ffmpeg to stitch these chunks back together.
+
+    :param input_file:
+    :param tempdir:
+    :param timestretch:
+    :return:
+    """
     # start and end are in seconds since the start of the video.
     # for an explanation of pts_expr please see timestretch.py
     files = []
     for i, (start, end, pts_expr) in enumerate(timestretch.generate_chunked_setpts_exprs(10_000)):
-        subprocess.check_call(['./private_ffmpeg', '-y',
-                               '-loglevel','quiet',
+        subprocess.check_call(['/home/seanw/PycharmProjects/jumpcutter/private_ffmpeg', '-y',
+                               '-loglevel', 'quiet',
                                '-stats',
                                # have 5 seconds of overlap between clips to avoid any possible missing spots
                                '-ss', str(start)] +
-                               ['-to', str(end+5)] if end is not None else [] +
+                               (['-to', str(end+5)] if end is not None else []) +
                                ['-i', input_file,
                                '-map', '0:v',  # ignore everything except the video track (no audio, no subtitles)
-                               #'-vf', 'trim=start=%.2f:end=%.2f' % (start, end+5),
                                '-vf', 'setpts='+pts_expr,
                                os.path.join(tempdir, 'clip%02d.mkv' % (i+1))
                                ])
         files.append(os.path.join(tempdir, 'clip%02d.mkv' % (i+1)))
-    return files
+    total_file_count = i+1
+    filters = ['movie=clip{0:02d}.mkv [v{0}]'.format(i+1) for i in range(total_file_count)]
+    filters.append(' '.join('[v{}]'.format(i+1) for i in range(total_file_count))+' interleave=n='+str(total_file_count))
+    return ';'.join(filters)
+
 
 
 def process_frames(tempdir, timestretch:NonLinearTime, framerate):
@@ -288,3 +341,26 @@ def _to_ass_time(time):
     mins, secs = divmod(time, 60)
     hrs, mins = divmod(mins, 60)
     return '%d:%d:%.02f' % (hrs, mins, secs)
+
+if __name__=='__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input_file')
+    parser.add_argument('output_file')
+    parser.add_argument('--threshold', type=float, help='(between 0 and 1) the N% median of all audio levels '
+                                                        'in the file will be used as the threshold for determining '
+                                                        'whether audio is silent or not.  Default: 0.7',
+                        default=0.7)
+    parser.add_argument('--padding', type=float, help='add N seconds of padding to the start and end of every sounded '
+                                                      'portion.  This helps reduce the number of state transitions. '
+                                                      'Set to 0 to disable this feature.  Default: 0.05',
+                        default=0.05)
+    parser.add_argument('--silent-speed', type=float, help='the RECIPROCAL of the factor by which to speed up silent '
+                                                           'portions of the video, i.e. 0.5 for a 2x speedup. '
+                                                           'Passing 0 (the default) will remove the silent portions '
+                                                           'altogether.', default=0)
+    parser.add_argument('--sounded-speed', type=float, help='the RECIPROCAL of the factor by which to speed up '
+                                                            'portions of the video where people are talking. '
+                                                            'Default: 1', default=1)
+    data = parser.parse_args()
+    jumpcut(data.input_file, data.output_file, data.threshold, data.padding, data.sounded_speed, data.silent_speed)
