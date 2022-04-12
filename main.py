@@ -177,12 +177,15 @@ def jumpcut(file, outfile, threshold=0.7, padding_time=0.02, sound_speed=1, sile
         _jumpcut_audio(file, os.path.join(tmpdir, 'audio.wav'), meaningful_parts)
         print('done.')
 
-        print('Processing video...')
-        video_filtergraph = process_video(file, tmpdir, converter)
-        print('done.')
+        # Decrease this to 150 to 100 or 99 if your ffmpeg version doesn't like
+        # the long expressions.
+        pts_exprs = list(converter.generate_chunked_setpts_exprs(150))
+        print('Video will be processed in %d chunks.' % len(pts_exprs))
+
+        # process_video will print the "Processing..." messages on main's behalf
+        video_filtergraph = process_video(file, tmpdir, pts_exprs)
 
         print('Encoding final result...')
-        # TODO make subtitles optional
         subprocess.check_call(['/home/seanw/PycharmProjects/jumpcutter/private_ffmpeg', '-y', '-hide_banner',
                                  '-filter_complex', video_filtergraph,
                                  '-i', 'audio.wav']  # wave file of audio (which we are piping into ffmpeg)
@@ -206,7 +209,7 @@ class _FakeTemporaryDirectory:
         pass
 
 
-def process_video(input_file, tempdir, timestretch:NonLinearTime):
+def process_video(input_file, tempdir, pts_exprs):
     """
     Apply nonlinear speedup to the video portion.  We do this by altering the presentation timestamp (PTS) of each frame
     using ffmpeg's setpts filter, which takes an expression that ffmpeg will evaluate internally for every frame of the
@@ -250,7 +253,9 @@ def process_video(input_file, tempdir, timestretch:NonLinearTime):
     # start and end are in seconds since the start of the video.
     # for an explanation of pts_expr please see timestretch.py
     files = []
-    for i, (start, end, pts_expr) in enumerate(timestretch.generate_chunked_setpts_exprs(10_000)):
+    print('\x1b[s', end='')  # VT100 save cursor position
+    for i, (start, end, pts_expr) in enumerate(pts_exprs):
+        print('\x1b[uProcessing video (chunk %d of %d)...' % (i+1, len(pts_exprs)))
         subprocess.check_call(['/home/seanw/PycharmProjects/jumpcutter/private_ffmpeg', '-y',
                                '-loglevel', 'quiet',
                                '-stats',
@@ -362,5 +367,8 @@ if __name__=='__main__':
     parser.add_argument('--sounded-speed', type=float, help='the RECIPROCAL of the factor by which to speed up '
                                                             'portions of the video where people are talking. '
                                                             'Default: 1', default=1)
+    parser.add_argument('--subtitle-file', help='Alternate subtitle file (default is to use the one baked into the '
+                                                'input file)', default=None)
     data = parser.parse_args()
-    jumpcut(data.input_file, data.output_file, data.threshold, data.padding, data.sounded_speed, data.silent_speed)
+    jumpcut(data.input_file, data.output_file, data.threshold, data.padding, data.sounded_speed, data.silent_speed,
+            data.subtitle_file)
