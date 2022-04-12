@@ -44,7 +44,7 @@ class NonLinearTime:
 
         return expr
 
-    def generate_chunked_setpts_exprs(self, max_depth=100, max_length=32767):
+    def generate_chunked_setpts_exprs(self, max_depth=100, max_length=32767, overlap=0):
         expr  = '!'
         last_good_expr = None
         # start current depth at 1 because if(lt( adds two levels of nesting, even though we subtract one immediately
@@ -68,14 +68,13 @@ class NonLinearTime:
             current_depth += 1
             if len(terminal_expr) < max_length and current_depth < max_depth:
                 last_good_expr = terminal_expr
-            if len(terminal_expr) > max_length or current_depth >= max_depth:
-                yield current_expr_start_time, end_time, last_good_expr
-                current_expr_start_time = start_time
+                expr = new_expr
+            else:
+                yield current_expr_start_time, start_time, last_good_expr
+                current_expr_start_time = start_time - overlap
                 current_depth = 0
                 expr = r'if(lt(PTS\,{1:.2f}/TB)\,{2:.2f}/TB+(PTS-{0:.2f}/TB)*{3}\,!)'.format(
                     start_time-current_expr_start_time, end_time-current_expr_start_time, output_time, relative_speed)
-            else:
-                expr = new_expr
         yield current_expr_start_time, end_time, last_good_expr
 
 
