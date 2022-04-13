@@ -186,7 +186,7 @@ def jumpcut(file, outfile, threshold=0.7, padding_time=0.02, sound_speed=1, sile
         video_filtergraph = process_video(file, tmpdir, pts_exprs)
 
         print('Encoding final result...')
-        subprocess.check_call(['/home/seanw/PycharmProjects/jumpcutter/private_ffmpeg', '-y', '-hide_banner',
+        subprocess.check_call(['ffmpeg', '-y', '-hide_banner',
                                  '-filter_complex', video_filtergraph,
                                  '-i', 'audio.wav']  # wave file of audio (which we are piping into ffmpeg)
                                  + (['-i', 'converted.ass'] if subtitles else [])  # subtitle file
@@ -196,7 +196,9 @@ def jumpcut(file, outfile, threshold=0.7, padding_time=0.02, sound_speed=1, sile
 
 
 class _FakeTemporaryDirectory:
-    """Drop in replacement for """
+    """Drop in replacement for tempfile.TemporaryDirectory that doesn't actually delete it when the program exits.
+    Useful for debugging.
+    """
     def __init__(self, dir):
         self.dir = dir
     def __enter__(self):
@@ -276,6 +278,9 @@ def process_video(input_file, tempdir, pts_exprs):
 
 
 def process_frames(tempdir, timestretch:NonLinearTime, framerate):
+    """Function to duplicate frames of video, used by a previous version of this program that was more similar
+    in operation to carykh's version.  Unused in the current version.
+    """
     input_frame = 1
     output_frame = 1
     while True:
@@ -301,6 +306,9 @@ def process_frames(tempdir, timestretch:NonLinearTime, framerate):
 
 
 def process_subtitles(infile, outfile, converter: NonLinearTime):
+    # what comes before the actual subtitle events in a Advanced SubStation (ASS) file is some formatting information
+    # (what font to render the subtitles in, font size, color etc.)
+    # Copy that information verbatim.
     for line in infile:
         outfile.write(line)
         if line.strip() == '[Events]':
@@ -317,13 +325,15 @@ def process_subtitles(infile, outfile, converter: NonLinearTime):
             continue
         parts = [x.strip() for x in rest.split(',', num_parts)]
         if type == 'Format':
-            # maintain these lines unchanged to the output.
+            # the ASS format is somewhat flexible, and uses Format: rows
+            # to define what CSV columns are used in the rest of the file.
+            # Maintain these lines unchanged to the output.
             outfile.write(line)
             num_parts = len(parts) - 1
             start_idx = parts.index('Start')
             end_idx = parts.index('End')
         elif type == 'Dialogue':
-            # 14-year-old me would be cringing so hard at this code
+            # rewrite the start and end time of the dialogue to match up with the changes we made to the video.
             start_time = _from_ass_time(parts[start_idx])
             start_time = converter.convert(start_time)
             parts[start_idx] = _to_ass_time(start_time)
@@ -333,6 +343,7 @@ def process_subtitles(infile, outfile, converter: NonLinearTime):
             parts[end_idx] = _to_ass_time(end_time)
             outfile.write('Dialogue: {}\n'.format(','.join(parts)))
         else:
+            # if we don't know what to do with a line, jut put it through verbatim.
             outfile.write(line)
     shutil.copyfileobj(infile, outfile)
 
